@@ -45,23 +45,42 @@ namespace cue::cuda {
 
     float sum(const float* a, size_t n);
 
-    //  convolution / pooling (NCHW layout) 
+    //  convolution / pooling (NCHW layout)
 
     void conv2d_forward(const float* input, const float* kernel, float* out,
                         size_t N, size_t Cin, size_t H, size_t W,
                         size_t Cout, size_t kH, size_t kW,
                         size_t stride, size_t padding);
+    void conv2d_backward_input(const float* grad_out, const float* kernel, float* grad_in,
+                               size_t N, size_t Cin, size_t H, size_t W,
+                               size_t Cout, size_t kH, size_t kW,
+                               size_t stride, size_t padding);
+    void conv2d_backward_kernel(const float* grad_out, const float* input, float* grad_kernel,
+                                size_t N, size_t Cin, size_t H, size_t W,
+                                size_t Cout, size_t kH, size_t kW,
+                                size_t stride, size_t padding);
     void max_pool2d_forward(const float* input, float* out,
                             size_t N, size_t C, size_t H, size_t W,
                             size_t kH, size_t kW,
                             size_t stride, size_t padding);
+    void max_pool2d_backward(const float* grad_out, const float* input, float* grad_in,
+                             size_t N, size_t C, size_t H, size_t W,
+                             size_t kH, size_t kW,
+                             size_t stride, size_t padding);
     void avg_pool2d_forward(const float* input, float* out,
                             size_t N, size_t C, size_t H, size_t W,
                             size_t kH, size_t kW,
                             size_t stride, size_t padding);
+    void avg_pool2d_backward(const float* grad_out, float* grad_in,
+                             size_t N, size_t C, size_t H, size_t W,
+                             size_t kH, size_t kW,
+                             size_t stride, size_t padding);
 
-    //  broadcasting helpers 
+    //  broadcasting helpers
 
     void bias_add_channel(const float* input, const float* bias, float* out,
                           size_t N, size_t C, size_t HW);
+    void sum_to_channel(const float* in, float* out,
+                        size_t N, size_t C, size_t HW);
+    void sum_axis0(const float* in, float* out, size_t N, size_t M);
 }

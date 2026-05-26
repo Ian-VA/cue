@@ -311,6 +311,189 @@ __global__ void bias_add_channel_k(const float *in, const float *bias,
   out[idx] = in[idx] + bias[c];
 }
 
+__global__ void sum_to_channel_k(const float *in, float *out, size_t N,
+                                 size_t C, size_t HW) {
+  size_t c = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C)
+    return;
+  float acc = 0.0f;
+  for (size_t n = 0; n < N; ++n) {
+    const float *row = in + (n * C + c) * HW;
+    for (size_t i = 0; i < HW; ++i)
+      acc += row[i];
+  }
+  out[c] = acc;
+}
+
+__global__ void sum_axis0_k(const float *in, float *out, size_t N, size_t M) {
+  size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= M)
+    return;
+  float acc = 0.0f;
+  for (size_t i = 0; i < N; ++i)
+    acc += in[i * M + j];
+  out[j] = acc;
+}
+
+// conv2d / pool backwards
+
+__global__ void conv2d_backward_input_k(const float *grad_out,
+                                        const float *ker, float *grad_in,
+                                        size_t N, size_t Cin, size_t H,
+                                        size_t W, size_t Cout, size_t kH,
+                                        size_t kW, size_t oH, size_t oW,
+                                        size_t stride, size_t padding) {
+  size_t total = N * Cin * H * W;
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total)
+    return;
+
+  size_t iw = idx % W;
+  size_t ih = (idx / W) % H;
+  size_t ci = (idx / (W * H)) % Cin;
+  size_t n = idx / (W * H * Cin);
+
+  float acc = 0.0f;
+  for (size_t co = 0; co < Cout; ++co) {
+    for (size_t ki = 0; ki < kH; ++ki) {
+      for (size_t kj = 0; kj < kW; ++kj) {
+        long long num_h = (long long)ih + (long long)padding - (long long)ki;
+        long long num_w = (long long)iw + (long long)padding - (long long)kj;
+        if (num_h < 0 || num_w < 0)
+          continue;
+        if ((size_t)num_h % stride != 0 || (size_t)num_w % stride != 0)
+          continue;
+        size_t oh = (size_t)num_h / stride;
+        size_t ow = (size_t)num_w / stride;
+        if (oh >= oH || ow >= oW)
+          continue;
+        size_t g_idx = ((n * Cout + co) * oH + oh) * oW + ow;
+        size_t k_idx = ((co * Cin + ci) * kH + ki) * kW + kj;
+        acc += grad_out[g_idx] * ker[k_idx];
+      }
+    }
+  }
+  grad_in[idx] = acc;
+}
+
+__global__ void conv2d_backward_kernel_k(const float *grad_out,
+                                         const float *in, float *grad_ker,
+                                         size_t N, size_t Cin, size_t H,
+                                         size_t W, size_t Cout, size_t kH,
+                                         size_t kW, size_t oH, size_t oW,
+                                         size_t stride, size_t padding) {
+  size_t total = Cout * Cin * kH * kW;
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total)
+    return;
+
+  size_t kj = idx % kW;
+  size_t ki = (idx / kW) % kH;
+  size_t ci = (idx / (kW * kH)) % Cin;
+  size_t co = idx / (kW * kH * Cin);
+
+  float acc = 0.0f;
+  for (size_t n = 0; n < N; ++n) {
+    for (size_t oh = 0; oh < oH; ++oh) {
+      for (size_t ow = 0; ow < oW; ++ow) {
+        long long ih = (long long)oh * stride + (long long)ki - (long long)padding;
+        long long iw = (long long)ow * stride + (long long)kj - (long long)padding;
+        if (ih < 0 || ih >= (long long)H)
+          continue;
+        if (iw < 0 || iw >= (long long)W)
+          continue;
+        size_t in_idx = ((n * Cin + ci) * H + (size_t)ih) * W + (size_t)iw;
+        size_t g_idx = ((n * Cout + co) * oH + oh) * oW + ow;
+        acc += in[in_idx] * grad_out[g_idx];
+      }
+    }
+  }
+  grad_ker[idx] = acc;
+}
+
+__global__ void max_pool2d_backward_k(const float *grad_out, const float *in,
+                                      float *grad_in, size_t N, size_t C,
+                                      size_t H, size_t W, size_t kH, size_t kW,
+                                      size_t oH, size_t oW, size_t stride,
+                                      size_t padding) {
+  size_t total = N * C * oH * oW;
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total)
+    return;
+
+  size_t ow = idx % oW;
+  size_t oh = (idx / oW) % oH;
+  size_t c = (idx / (oW * oH)) % C;
+  size_t n = idx / (oW * oH * C);
+
+  float m = -INFINITY;
+  long long best_ih = -1, best_iw = -1;
+  for (size_t ki = 0; ki < kH; ++ki) {
+    for (size_t kj = 0; kj < kW; ++kj) {
+      long long ih = (long long)oh * stride + (long long)ki - (long long)padding;
+      long long iw = (long long)ow * stride + (long long)kj - (long long)padding;
+      if (ih < 0 || ih >= (long long)H)
+        continue;
+      if (iw < 0 || iw >= (long long)W)
+        continue;
+      float v = in[((n * C + c) * H + (size_t)ih) * W + (size_t)iw];
+      if (v > m) {
+        m = v;
+        best_ih = ih;
+        best_iw = iw;
+      }
+    }
+  }
+  if (best_ih < 0)
+    return;
+  size_t in_idx = ((n * C + c) * H + (size_t)best_ih) * W + (size_t)best_iw;
+  atomicAdd(&grad_in[in_idx], grad_out[idx]);
+}
+
+__global__ void avg_pool2d_backward_k(const float *grad_out, float *grad_in,
+                                      size_t N, size_t C, size_t H, size_t W,
+                                      size_t kH, size_t kW, size_t oH,
+                                      size_t oW, size_t stride,
+                                      size_t padding) {
+  size_t total = N * C * oH * oW;
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total)
+    return;
+
+  size_t ow = idx % oW;
+  size_t oh = (idx / oW) % oH;
+  size_t c = (idx / (oW * oH)) % C;
+  size_t n = idx / (oW * oH * C);
+
+  size_t count = 0;
+  for (size_t ki = 0; ki < kH; ++ki) {
+    for (size_t kj = 0; kj < kW; ++kj) {
+      long long ih = (long long)oh * stride + (long long)ki - (long long)padding;
+      long long iw = (long long)ow * stride + (long long)kj - (long long)padding;
+      if (ih < 0 || ih >= (long long)H)
+        continue;
+      if (iw < 0 || iw >= (long long)W)
+        continue;
+      ++count;
+    }
+  }
+  if (count == 0)
+    return;
+  float share = grad_out[idx] / (float)count;
+  for (size_t ki = 0; ki < kH; ++ki) {
+    for (size_t kj = 0; kj < kW; ++kj) {
+      long long ih = (long long)oh * stride + (long long)ki - (long long)padding;
+      long long iw = (long long)ow * stride + (long long)kj - (long long)padding;
+      if (ih < 0 || ih >= (long long)H)
+        continue;
+      if (iw < 0 || iw >= (long long)W)
+        continue;
+      size_t in_idx = ((n * C + c) * H + (size_t)ih) * W + (size_t)iw;
+      atomicAdd(&grad_in[in_idx], share);
+    }
+  }
+}
+
 } // namespace
 
 namespace cue::cuda {
@@ -497,6 +680,59 @@ void avg_pool2d_forward(const float *input, float *out, size_t N, size_t C,
   cuda_check(cudaGetLastError(), "avg_pool2d");
 }
 
+void conv2d_backward_input(const float *grad_out, const float *kernel,
+                           float *grad_in, size_t N, size_t Cin, size_t H,
+                           size_t W, size_t Cout, size_t kH, size_t kW,
+                           size_t stride, size_t padding) {
+  size_t oH = (H + 2 * padding - kH) / stride + 1;
+  size_t oW = (W + 2 * padding - kW) / stride + 1;
+  size_t total = N * Cin * H * W;
+  conv2d_backward_input_k<<<grid_size(total, THREADS), THREADS>>>(
+      grad_out, kernel, grad_in, N, Cin, H, W, Cout, kH, kW, oH, oW, stride,
+      padding);
+  cuda_check(cudaGetLastError(), "conv2d_backward_input");
+}
+
+void conv2d_backward_kernel(const float *grad_out, const float *input,
+                            float *grad_kernel, size_t N, size_t Cin, size_t H,
+                            size_t W, size_t Cout, size_t kH, size_t kW,
+                            size_t stride, size_t padding) {
+  size_t oH = (H + 2 * padding - kH) / stride + 1;
+  size_t oW = (W + 2 * padding - kW) / stride + 1;
+  size_t total = Cout * Cin * kH * kW;
+  conv2d_backward_kernel_k<<<grid_size(total, THREADS), THREADS>>>(
+      grad_out, input, grad_kernel, N, Cin, H, W, Cout, kH, kW, oH, oW, stride,
+      padding);
+  cuda_check(cudaGetLastError(), "conv2d_backward_kernel");
+}
+
+void max_pool2d_backward(const float *grad_out, const float *input,
+                         float *grad_in, size_t N, size_t C, size_t H,
+                         size_t W, size_t kH, size_t kW, size_t stride,
+                         size_t padding) {
+  size_t oH = (H + 2 * padding - kH) / stride + 1;
+  size_t oW = (W + 2 * padding - kW) / stride + 1;
+  cuda_check(cudaMemset(grad_in, 0, N * C * H * W * sizeof(float)),
+             "max_pool2d_backward.memset");
+  size_t total = N * C * oH * oW;
+  max_pool2d_backward_k<<<grid_size(total, THREADS), THREADS>>>(
+      grad_out, input, grad_in, N, C, H, W, kH, kW, oH, oW, stride, padding);
+  cuda_check(cudaGetLastError(), "max_pool2d_backward");
+}
+
+void avg_pool2d_backward(const float *grad_out, float *grad_in, size_t N,
+                         size_t C, size_t H, size_t W, size_t kH, size_t kW,
+                         size_t stride, size_t padding) {
+  size_t oH = (H + 2 * padding - kH) / stride + 1;
+  size_t oW = (W + 2 * padding - kW) / stride + 1;
+  cuda_check(cudaMemset(grad_in, 0, N * C * H * W * sizeof(float)),
+             "avg_pool2d_backward.memset");
+  size_t total = N * C * oH * oW;
+  avg_pool2d_backward_k<<<grid_size(total, THREADS), THREADS>>>(
+      grad_out, grad_in, N, C, H, W, kH, kW, oH, oW, stride, padding);
+  cuda_check(cudaGetLastError(), "avg_pool2d_backward");
+}
+
 // bias
 void bias_add_channel(const float *input, const float *bias, float *out,
                       size_t N, size_t C, size_t HW) {
@@ -504,6 +740,17 @@ void bias_add_channel(const float *input, const float *bias, float *out,
   bias_add_channel_k<<<grid_size(total, THREADS), THREADS>>>(input, bias, out,
                                                              N, C, HW);
   cuda_check(cudaGetLastError(), "bias_add_channel");
+}
+
+void sum_to_channel(const float *in, float *out, size_t N, size_t C,
+                    size_t HW) {
+  sum_to_channel_k<<<grid_size(C, THREADS), THREADS>>>(in, out, N, C, HW);
+  cuda_check(cudaGetLastError(), "sum_to_channel");
+}
+
+void sum_axis0(const float *in, float *out, size_t N, size_t M) {
+  sum_axis0_k<<<grid_size(M, THREADS), THREADS>>>(in, out, N, M);
+  cuda_check(cudaGetLastError(), "sum_axis0");
 }
 
 } // namespace cue::cuda

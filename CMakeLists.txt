@@ -11,18 +11,32 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
-# The tensor module is mostly a header-only template library; the only
-# compiled unit is the CUDA dispatch layer in cuda_ops.cu. Anything that
-# links cue_tensor picks up the include directory and libcudart.
-add_library(cue_tensor STATIC tensor/cuda_ops.cu)
-target_include_directories(cue_tensor PUBLIC tensor)
-set_target_properties(cue_tensor PROPERTIES
+# Single archive holds the CUDA dispatch layer plus the pure-C++ nn and
+# data modules. Bundling them avoids the extra device-link step that
+# downstream-only CXX libraries trigger when they transitively depend on
+# CUDA-separable code.
+add_library(cue STATIC
+    tensor/cuda_ops.cu
+    nn/nn.cpp
+    data/dataset.cpp
+)
+target_include_directories(cue PUBLIC tensor nn data)
+set_target_properties(cue PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CUDA_SEPARABLE_COMPILATION ON
 )
+target_compile_options(cue PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
+)
 
 enable_testing()
-add_executable(test_tensor tests/test_tensor.cpp)
-target_link_libraries(test_tensor PRIVATE cue_tensor)
-target_compile_options(test_tensor PRIVATE -Wall -Wextra)
-add_test(NAME tensor COMMAND test_tensor)
+
+foreach(t IN ITEMS test_tensor test_nn test_data test_train_iris)
+    add_executable(${t} tests/${t}.cpp)
+    target_link_libraries(${t} PRIVATE cue)
+    target_compile_options(${t} PRIVATE -Wall -Wextra)
+    add_test(NAME ${t} COMMAND ${t})
+endforeach()
+
+target_compile_definitions(test_train_iris
+    PRIVATE CUE_DATA_DIR="${CMAKE_SOURCE_DIR}/data")

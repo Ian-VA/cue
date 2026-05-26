@@ -78,6 +78,8 @@ template<typename Val>
 class Tensor {
     public:
 
+        Tensor() = default;
+
         explicit Tensor(const std::vector<Index> &shape, Device device = Device::CPU)
                 : _shape(shape), _device(device) {
             init();
@@ -549,6 +551,244 @@ class Tensor {
             return pool2d(kH, kW, stride, padding, /*max_mode=*/false);
         }
 
+        Tensor<Val> conv2d_backward_input(const Tensor<Val>& kernel,
+                                          const std::vector<Index>& input_shape,
+                                          Index stride = 1, Index padding = 0) const {
+            if (rank() != 4 || kernel.rank() != 4) {
+                throw std::invalid_argument("conv2d_backward_input expects 4D operands");
+            }
+            if (input_shape.size() != 4) {
+                throw std::invalid_argument("input_shape must be 4D");
+            }
+            check_same_device(kernel);
+
+            Index N    = input_shape[0];
+            Index Cin  = input_shape[1];
+            Index H    = input_shape[2];
+            Index W    = input_shape[3];
+            Index Cout = kernel._shape[0];
+            Index kH   = kernel._shape[2];
+            Index kW   = kernel._shape[3];
+            Index oH   = _shape[2];
+            Index oW   = _shape[3];
+
+            Tensor<Val> grad_in(input_shape, _device);
+
+            if (_device == Device::CPU) {
+                const Val* g  = _storage->data();
+                const Val* ke = kernel._storage->data();
+                Val*       gi = grad_in._storage->data();
+                std::fill_n(gi, grad_in.size(), Val(0));
+                for (Index n = 0; n < N; ++n) {
+                    for (Index co = 0; co < Cout; ++co) {
+                        for (Index oh = 0; oh < oH; ++oh) {
+                            for (Index ow = 0; ow < oW; ++ow) {
+                                Val g_val = g[((n*Cout + co)*oH + oh)*oW + ow];
+                                for (Index ci = 0; ci < Cin; ++ci) {
+                                    for (Index ki = 0; ki < kH; ++ki) {
+                                        for (Index kj = 0; kj < kW; ++kj) {
+                                            long long ih = (long long)oh*stride + (long long)ki - (long long)padding;
+                                            long long iw = (long long)ow*stride + (long long)kj - (long long)padding;
+                                            if (ih < 0 || ih >= (long long)H) continue;
+                                            if (iw < 0 || iw >= (long long)W) continue;
+                                            Index in_idx = ((n*Cin + ci)*H + (Index)ih)*W + (Index)iw;
+                                            Index k_idx  = ((co*Cin + ci)*kH + ki)*kW + kj;
+                                            gi[in_idx] += g_val * ke[k_idx];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if constexpr (std::is_same_v<Val, float>) {
+                cue::cuda::conv2d_backward_input(
+                    _storage->data(), kernel._storage->data(),
+                    grad_in._storage->data(),
+                    N, Cin, H, W, Cout, kH, kW, stride, padding);
+            }
+            return grad_in;
+        }
+
+        Tensor<Val> conv2d_backward_kernel(const Tensor<Val>& input,
+                                           const std::vector<Index>& kernel_shape,
+                                           Index stride = 1, Index padding = 0) const {
+            if (rank() != 4 || input.rank() != 4) {
+                throw std::invalid_argument("conv2d_backward_kernel expects 4D operands");
+            }
+            if (kernel_shape.size() != 4) {
+                throw std::invalid_argument("kernel_shape must be 4D");
+            }
+            check_same_device(input);
+
+            Index N    = input._shape[0];
+            Index Cin  = input._shape[1];
+            Index H    = input._shape[2];
+            Index W    = input._shape[3];
+            Index Cout = kernel_shape[0];
+            Index kH   = kernel_shape[2];
+            Index kW   = kernel_shape[3];
+            Index oH   = _shape[2];
+            Index oW   = _shape[3];
+
+            Tensor<Val> grad_k(kernel_shape, _device);
+
+            if (_device == Device::CPU) {
+                const Val* g  = _storage->data();
+                const Val* in_ = input._storage->data();
+                Val*       gk = grad_k._storage->data();
+                std::fill_n(gk, grad_k.size(), Val(0));
+                for (Index co = 0; co < Cout; ++co) {
+                    for (Index ci = 0; ci < Cin; ++ci) {
+                        for (Index ki = 0; ki < kH; ++ki) {
+                            for (Index kj = 0; kj < kW; ++kj) {
+                                Val acc = Val(0);
+                                for (Index n = 0; n < N; ++n) {
+                                    for (Index oh = 0; oh < oH; ++oh) {
+                                        for (Index ow = 0; ow < oW; ++ow) {
+                                            long long ih = (long long)oh*stride + (long long)ki - (long long)padding;
+                                            long long iw = (long long)ow*stride + (long long)kj - (long long)padding;
+                                            if (ih < 0 || ih >= (long long)H) continue;
+                                            if (iw < 0 || iw >= (long long)W) continue;
+                                            Index in_idx = ((n*Cin + ci)*H + (Index)ih)*W + (Index)iw;
+                                            Index g_idx  = ((n*Cout + co)*oH + oh)*oW + ow;
+                                            acc += in_[in_idx] * g[g_idx];
+                                        }
+                                    }
+                                }
+                                gk[((co*Cin + ci)*kH + ki)*kW + kj] = acc;
+                            }
+                        }
+                    }
+                }
+            } else if constexpr (std::is_same_v<Val, float>) {
+                cue::cuda::conv2d_backward_kernel(
+                    _storage->data(), input._storage->data(),
+                    grad_k._storage->data(),
+                    N, Cin, H, W, Cout, kH, kW, stride, padding);
+            }
+            return grad_k;
+        }
+
+        Tensor<Val> max_pool2d_backward(const Tensor<Val>& input,
+                                        Index kH, Index kW,
+                                        Index stride = 0, Index padding = 0) const {
+            return pool2d_backward(input, kH, kW, stride, padding, /*max_mode=*/true);
+        }
+
+        Tensor<Val> avg_pool2d_backward(const std::vector<Index>& input_shape,
+                                        Index kH, Index kW,
+                                        Index stride = 0, Index padding = 0) const {
+            if (stride == 0) stride = kH;
+
+            Index N = input_shape[0];
+            Index C = input_shape[1];
+            Index H = input_shape[2];
+            Index W = input_shape[3];
+            Index oH = _shape[2];
+            Index oW = _shape[3];
+
+            Tensor<Val> grad_in(input_shape, _device);
+
+            if (_device == Device::CPU) {
+                const Val* g  = _storage->data();
+                Val*       gi = grad_in._storage->data();
+                std::fill_n(gi, grad_in.size(), Val(0));
+                for (Index n = 0; n < N; ++n) {
+                    for (Index c = 0; c < C; ++c) {
+                        for (Index oh = 0; oh < oH; ++oh) {
+                            for (Index ow = 0; ow < oW; ++ow) {
+                                Index count = 0;
+                                for (Index ki = 0; ki < kH; ++ki) {
+                                    for (Index kj = 0; kj < kW; ++kj) {
+                                        long long ih = (long long)oh*stride + (long long)ki - (long long)padding;
+                                        long long iw = (long long)ow*stride + (long long)kj - (long long)padding;
+                                        if (ih < 0 || ih >= (long long)H) continue;
+                                        if (iw < 0 || iw >= (long long)W) continue;
+                                        ++count;
+                                    }
+                                }
+                                if (count == 0) continue;
+                                Val share = g[((n*C + c)*oH + oh)*oW + ow] / Val(count);
+                                for (Index ki = 0; ki < kH; ++ki) {
+                                    for (Index kj = 0; kj < kW; ++kj) {
+                                        long long ih = (long long)oh*stride + (long long)ki - (long long)padding;
+                                        long long iw = (long long)ow*stride + (long long)kj - (long long)padding;
+                                        if (ih < 0 || ih >= (long long)H) continue;
+                                        if (iw < 0 || iw >= (long long)W) continue;
+                                        gi[((n*C + c)*H + (Index)ih)*W + (Index)iw] += share;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if constexpr (std::is_same_v<Val, float>) {
+                cue::cuda::avg_pool2d_backward(_storage->data(),
+                                               grad_in._storage->data(),
+                                               N, C, H, W, kH, kW, stride, padding);
+            }
+            return grad_in;
+        }
+
+        Tensor<Val> sum_to_channel() const {
+            if (rank() < 2) {
+                throw std::invalid_argument("sum_to_channel requires rank >= 2");
+            }
+            Index N = _shape[0];
+            Index C = _shape[1];
+            Index HW = 1;
+            for (Index d = 2; d < rank(); ++d) HW *= _shape[d];
+
+            Tensor<Val> out({C}, _device);
+            if (_device == Device::CPU) {
+                const Val* in_  = _storage->data();
+                Val*       out_ = out._storage->data();
+                std::fill_n(out_, C, Val(0));
+                for (Index n = 0; n < N; ++n) {
+                    for (Index c = 0; c < C; ++c) {
+                        const Val* row = in_ + (n*C + c) * HW;
+                        Val acc = Val(0);
+                        for (Index i = 0; i < HW; ++i) acc += row[i];
+                        out_[c] += acc;
+                    }
+                }
+            } else if constexpr (std::is_same_v<Val, float>) {
+                cue::cuda::sum_to_channel(_storage->data(), out._storage->data(),
+                                          N, C, HW);
+            }
+            return out;
+        }
+
+        Tensor<Val> sum_axis0() const {
+            if (rank() == 0 || size() == 0) {
+                throw std::invalid_argument("sum_axis0 requires a non-empty tensor");
+            }
+            Index N = _shape[0];
+            Index M = size() / N;
+
+            std::vector<Index> out_shape;
+            if (rank() == 1) {
+                out_shape.push_back(1);
+            } else {
+                out_shape.reserve(rank() - 1);
+                for (Index d = 1; d < rank(); ++d) out_shape.push_back(_shape[d]);
+            }
+            Tensor<Val> out(out_shape, _device);
+
+            if (_device == Device::CPU) {
+                const Val* in_  = _storage->data();
+                Val*       out_ = out._storage->data();
+                std::fill_n(out_, M, Val(0));
+                for (Index i = 0; i < N; ++i) {
+                    for (Index j = 0; j < M; ++j) out_[j] += in_[i*M + j];
+                }
+            } else if constexpr (std::is_same_v<Val, float>) {
+                cue::cuda::sum_axis0(_storage->data(), out._storage->data(), N, M);
+            }
+            return out;
+        }
+
         Tensor<Val> add_bias(const Tensor<Val>& bias) const {
             if (bias.rank() != 1) {
                 throw std::invalid_argument("bias must be 1D");
@@ -738,6 +978,67 @@ class Tensor {
                 }
             }
             return out;
+        }
+
+        Tensor<Val> pool2d_backward(const Tensor<Val>& input,
+                                    Index kH, Index kW,
+                                    Index stride, Index padding,
+                                    bool max_mode) const {
+            if (input.rank() != 4) {
+                throw std::invalid_argument("pool2d_backward expects a 4D input");
+            }
+            check_same_device(input);
+            if (stride == 0) stride = kH;
+
+            Index N = input._shape[0];
+            Index C = input._shape[1];
+            Index H = input._shape[2];
+            Index W = input._shape[3];
+            Index oH = _shape[2];
+            Index oW = _shape[3];
+
+            Tensor<Val> grad_in(input._shape, _device);
+
+            if (_device == Device::CPU) {
+                const Val* g    = _storage->data();
+                const Val* in_  = input._storage->data();
+                Val*       gi   = grad_in._storage->data();
+                std::fill_n(gi, grad_in.size(), Val(0));
+                for (Index n = 0; n < N; ++n) {
+                    for (Index c = 0; c < C; ++c) {
+                        for (Index oh = 0; oh < oH; ++oh) {
+                            for (Index ow = 0; ow < oW; ++ow) {
+                                Val   m       = std::numeric_limits<Val>::lowest();
+                                long long best_ih = -1, best_iw = -1;
+                                if (max_mode) {
+                                    for (Index ki = 0; ki < kH; ++ki) {
+                                        for (Index kj = 0; kj < kW; ++kj) {
+                                            long long ih = (long long)oh*stride + (long long)ki - (long long)padding;
+                                            long long iw = (long long)ow*stride + (long long)kj - (long long)padding;
+                                            if (ih < 0 || ih >= (long long)H) continue;
+                                            if (iw < 0 || iw >= (long long)W) continue;
+                                            Val v = in_[((n*C + c)*H + (Index)ih)*W + (Index)iw];
+                                            if (v > m) {
+                                                m       = v;
+                                                best_ih = ih;
+                                                best_iw = iw;
+                                            }
+                                        }
+                                    }
+                                    if (best_ih < 0) continue;
+                                    Index in_idx = ((n*C + c)*H + (Index)best_ih)*W + (Index)best_iw;
+                                    gi[in_idx] += g[((n*C + c)*oH + oh)*oW + ow];
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if constexpr (std::is_same_v<Val, float>) {
+                cue::cuda::max_pool2d_backward(_storage->data(), input._storage->data(),
+                                               grad_in._storage->data(),
+                                               N, C, H, W, kH, kW, stride, padding);
+            }
+            return grad_in;
         }
 
         Index index(std::initializer_list<Index> coord) const {
