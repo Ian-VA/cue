@@ -115,7 +115,7 @@ class Tensor {
             }
         }
 
-        // ---- factories ----
+        //  factories 
 
         static Tensor<Val> zeros(const std::vector<Index>& shape, Device device = Device::CPU) {
             return Tensor<Val>(shape, device);
@@ -152,7 +152,7 @@ class Tensor {
             return device == Device::CPU ? cpu : cpu.to_cuda();
         }
 
-        // ---- introspection ----
+        //  introspection 
 
         const std::vector<Index>& shape()   const noexcept { return _shape; }
         const std::vector<Index>& stride()  const noexcept { return _stride; }
@@ -164,7 +164,7 @@ class Tensor {
         Val*       data()       noexcept { return _storage->data(); }
         const Val* data() const noexcept { return _storage->data(); }
 
-        // ---- device transfer ----
+        //  device transfer 
 
         Tensor<Val> to(Device device) const {
             if (device == _device) return *this;
@@ -211,7 +211,7 @@ class Tensor {
             return out;
         }
 
-        // ---- shape manipulation ----
+        //  shape manipulation 
 
         void reshape(const std::vector<Index>& shape) {
             Index product = 1;
@@ -291,7 +291,7 @@ class Tensor {
             return on_cuda() ? out.to_cuda() : out;
         }
 
-        // ---- element access ----
+        //  element access 
 
         Val operator[](std::initializer_list<Index> coord) const {
             require_cpu("operator[]");
@@ -303,7 +303,7 @@ class Tensor {
             return _storage->data()[index(coord)];
         }
 
-        // ---- element-wise arithmetic ----
+        //  element-wise arithmetic 
 
         Tensor<Val> add(const Tensor<Val>& other) const { return elementwise(other, Op::Add); }
         Tensor<Val> sub(const Tensor<Val>& other) const { return elementwise(other, Op::Sub); }
@@ -331,7 +331,7 @@ class Tensor {
         Tensor<Val>& operator*=(const Tensor<Val>& other) { *this = mul(other); return *this; }
         Tensor<Val>& operator/=(const Tensor<Val>& other) { *this = div(other); return *this; }
 
-        // ---- linear algebra ----
+        //  linear algebra 
 
         Tensor<Val> matmul(const Tensor<Val>& other) const {
             if (rank() != 2 || other.rank() != 2) {
@@ -366,7 +366,7 @@ class Tensor {
             return out;
         }
 
-        // ---- reductions ----
+        //  reductions 
 
         Val sum() const {
             if (size() == 0) return Val(0);
@@ -386,7 +386,7 @@ class Tensor {
             return size() == 0 ? Val(0) : sum() / Val(size());
         }
 
-        // ---- activations ----
+        //  activations 
 
         Tensor<Val> relu() const {
             Tensor<Val> out(_shape, _device);
@@ -500,7 +500,7 @@ class Tensor {
             return out;
         }
 
-        // ---- convolution / pooling ----
+        //  convolution / pooling 
 
         Tensor<Val> conv2d(const Tensor<Val>& kernel,
                            Index stride = 1, Index padding = 0) const {

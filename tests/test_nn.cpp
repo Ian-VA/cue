@@ -199,7 +199,6 @@ TEST(maxpool, forward_backward) {
 
 TEST(maxpool, gradcheck) {
     MaxPool2d layer(2, 2);
-    // Inputs are jittered to avoid argmax ties that break the numerical check.
     Tensor<float> x({2, 2, 4, 4}, Device::CPU);
     for (Index i = 0; i < x.size(); ++i) x.data()[i] = (float)i * 0.13f;
 
@@ -319,10 +318,13 @@ TEST(sgd, reduces_loss) {
     model.emplace<ReLU>();
     model.emplace<Linear>(8, 3);
 
-    // Toy dataset: a fixed (x, y) pair we want the model to memorise.
     auto x = Tensor<float>::randn({16, 4});
     Tensor<int> y({16}, Device::CPU);
-    for (Index i = 0; i < 16; ++i) y.data()[i] = (int)(i % 3);
+    for (Index i = 0; i < 16; ++i) { // toy dataset
+        int c = (int)(i % 3);
+        y.data()[i] = c;
+        x.data()[i*4 + c] += 3.0f;
+    }
 
     CrossEntropyLoss loss;
     SGD opt(model.parameters(), 0.05f);

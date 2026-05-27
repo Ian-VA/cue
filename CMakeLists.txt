@@ -11,10 +11,6 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
-# Single archive holds the CUDA dispatch layer plus the pure-C++ nn and
-# data modules. Bundling them avoids the extra device-link step that
-# downstream-only CXX libraries trigger when they transitively depend on
-# CUDA-separable code.
 add_library(cue STATIC
     tensor/cuda_ops.cu
     nn/nn.cpp

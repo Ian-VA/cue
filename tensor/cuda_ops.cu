@@ -100,6 +100,7 @@ __global__ void log_k(const float *a, float *out, size_t n) {
     out[i] = logf(a[i]);
 }
 
+// binary tree reduction sums
 __global__ void softmax_last_dim_k(const float *in, float *out, size_t outer,
                                    size_t inner) {
   extern __shared__ float shared[];
@@ -337,12 +338,12 @@ __global__ void sum_axis0_k(const float *in, float *out, size_t N, size_t M) {
 
 // conv2d / pool backwards
 
-__global__ void conv2d_backward_input_k(const float *grad_out,
-                                        const float *ker, float *grad_in,
-                                        size_t N, size_t Cin, size_t H,
-                                        size_t W, size_t Cout, size_t kH,
-                                        size_t kW, size_t oH, size_t oW,
-                                        size_t stride, size_t padding) {
+__global__ void conv2d_backward_input_k(const float *grad_out, const float *ker,
+                                        float *grad_in, size_t N, size_t Cin,
+                                        size_t H, size_t W, size_t Cout,
+                                        size_t kH, size_t kW, size_t oH,
+                                        size_t oW, size_t stride,
+                                        size_t padding) {
   size_t total = N * Cin * H * W;
   size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total)
@@ -376,12 +377,12 @@ __global__ void conv2d_backward_input_k(const float *grad_out,
   grad_in[idx] = acc;
 }
 
-__global__ void conv2d_backward_kernel_k(const float *grad_out,
-                                         const float *in, float *grad_ker,
-                                         size_t N, size_t Cin, size_t H,
-                                         size_t W, size_t Cout, size_t kH,
-                                         size_t kW, size_t oH, size_t oW,
-                                         size_t stride, size_t padding) {
+__global__ void conv2d_backward_kernel_k(const float *grad_out, const float *in,
+                                         float *grad_ker, size_t N, size_t Cin,
+                                         size_t H, size_t W, size_t Cout,
+                                         size_t kH, size_t kW, size_t oH,
+                                         size_t oW, size_t stride,
+                                         size_t padding) {
   size_t total = Cout * Cin * kH * kW;
   size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total)
@@ -396,8 +397,10 @@ __global__ void conv2d_backward_kernel_k(const float *grad_out,
   for (size_t n = 0; n < N; ++n) {
     for (size_t oh = 0; oh < oH; ++oh) {
       for (size_t ow = 0; ow < oW; ++ow) {
-        long long ih = (long long)oh * stride + (long long)ki - (long long)padding;
-        long long iw = (long long)ow * stride + (long long)kj - (long long)padding;
+        long long ih =
+            (long long)oh * stride + (long long)ki - (long long)padding;
+        long long iw =
+            (long long)ow * stride + (long long)kj - (long long)padding;
         if (ih < 0 || ih >= (long long)H)
           continue;
         if (iw < 0 || iw >= (long long)W)
@@ -430,8 +433,10 @@ __global__ void max_pool2d_backward_k(const float *grad_out, const float *in,
   long long best_ih = -1, best_iw = -1;
   for (size_t ki = 0; ki < kH; ++ki) {
     for (size_t kj = 0; kj < kW; ++kj) {
-      long long ih = (long long)oh * stride + (long long)ki - (long long)padding;
-      long long iw = (long long)ow * stride + (long long)kj - (long long)padding;
+      long long ih =
+          (long long)oh * stride + (long long)ki - (long long)padding;
+      long long iw =
+          (long long)ow * stride + (long long)kj - (long long)padding;
       if (ih < 0 || ih >= (long long)H)
         continue;
       if (iw < 0 || iw >= (long long)W)
@@ -468,8 +473,10 @@ __global__ void avg_pool2d_backward_k(const float *grad_out, float *grad_in,
   size_t count = 0;
   for (size_t ki = 0; ki < kH; ++ki) {
     for (size_t kj = 0; kj < kW; ++kj) {
-      long long ih = (long long)oh * stride + (long long)ki - (long long)padding;
-      long long iw = (long long)ow * stride + (long long)kj - (long long)padding;
+      long long ih =
+          (long long)oh * stride + (long long)ki - (long long)padding;
+      long long iw =
+          (long long)ow * stride + (long long)kj - (long long)padding;
       if (ih < 0 || ih >= (long long)H)
         continue;
       if (iw < 0 || iw >= (long long)W)
@@ -482,8 +489,10 @@ __global__ void avg_pool2d_backward_k(const float *grad_out, float *grad_in,
   float share = grad_out[idx] / (float)count;
   for (size_t ki = 0; ki < kH; ++ki) {
     for (size_t kj = 0; kj < kW; ++kj) {
-      long long ih = (long long)oh * stride + (long long)ki - (long long)padding;
-      long long iw = (long long)ow * stride + (long long)kj - (long long)padding;
+      long long ih =
+          (long long)oh * stride + (long long)ki - (long long)padding;
+      long long iw =
+          (long long)ow * stride + (long long)kj - (long long)padding;
       if (ih < 0 || ih >= (long long)H)
         continue;
       if (iw < 0 || iw >= (long long)W)
@@ -707,9 +716,8 @@ void conv2d_backward_kernel(const float *grad_out, const float *input,
 }
 
 void max_pool2d_backward(const float *grad_out, const float *input,
-                         float *grad_in, size_t N, size_t C, size_t H,
-                         size_t W, size_t kH, size_t kW, size_t stride,
-                         size_t padding) {
+                         float *grad_in, size_t N, size_t C, size_t H, size_t W,
+                         size_t kH, size_t kW, size_t stride, size_t padding) {
   size_t oH = (H + 2 * padding - kH) / stride + 1;
   size_t oW = (W + 2 * padding - kW) / stride + 1;
   cuda_check(cudaMemset(grad_in, 0, N * C * H * W * sizeof(float)),

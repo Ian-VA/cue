@@ -179,7 +179,7 @@ void Dataset::apply_normalisation(const std::vector<float>& mean,
     }
 }
 
-// CSV → Dataset
+// CSV to Dataset
 
 Dataset from_csv(const CsvTable& table, const std::vector<Index>& feature_shape) {
     if (table.rows.empty()) {

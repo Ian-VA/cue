@@ -17,8 +17,7 @@ struct CsvTable {
 CsvTable read_csv(const std::string& path,
                   char delim = ',', bool has_header = true);
 
-// In-memory dataset of (features, label) pairs. Features live as a flat
-// row-major buffer matched to a feature shape; labels are integer class ids.
+// In-memory dataset of (features, label) pairs. Features are a flat row-major buffer while labels are integer class ids
 class Dataset {
     public:
         Dataset(std::vector<float>        features,
@@ -42,9 +41,7 @@ class Dataset {
             batch(const std::vector<Index>& indices,
                   Device device = Device::CPU) const;
 
-        // Z-score normalise each feature column using statistics computed
-        // from this dataset. Returns the (mean, std) used so later splits
-        // can be normalised the same way.
+        // Z-score normalise each feature column using statistics computed from this dataset. Returns (mean, std)
         std::pair<std::vector<float>, std::vector<float>> normalise();
         void apply_normalisation(const std::vector<float>& mean,
                                  const std::vector<float>& stddev);
@@ -58,7 +55,7 @@ class Dataset {
 };
 
 // Build a Dataset from a CSV table. The last column is treated as the class
-// label; remaining columns are parsed as floats. Class strings are mapped to
+// label while remaining columns are parsed as floats. Class strings are mapped to
 // integer ids in first-seen order.
 Dataset from_csv(const CsvTable& table,
                  const std::vector<Index>& feature_shape);
