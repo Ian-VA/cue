@@ -10,6 +10,7 @@
 using cue::data::Dataset;
 using cue::data::DataLoader;
 using cue::data::from_csv;
+using cue::data::from_tensors;
 using cue::data::read_csv;
 
 static std::string write_tmp_csv(const std::string& body, const std::string& tag) {
@@ -123,12 +124,117 @@ TEST(dataset, normalise) {
     REQUIRE_CLOSE(mean[1], 15.0f, 1e-6);
 
     auto [x, _] = ds.batch({0, 1});
-    // Each normalised value should have magnitude 1 (single-pair samples).
+    // each normalised value should have magnitude 1 for single pair samples
     for (Index i = 0; i < x.size(); ++i) {
         REQUIRE_CLOSE(std::abs(x.data()[i]), 1.0f, 1e-5);
     }
 }
 
+
+TEST(dataset, from_stacked_tensors) {
+    // (n, 2, 2) feature tensor and 1-d label tensor built purely from tensors
+    auto features = Tensor<float>::from_values({
+        {1, 2, 3, 4},
+        {5, 6, 7, 8},
+        {9, 10, 11, 12},
+    });
+    features.reshape({3, 2, 2});
+
+    Tensor<int> labels(std::vector<Index>{3});
+    labels.data()[0] = 0;
+    labels.data()[1] = 1;
+    labels.data()[2] = 0;
+
+    auto ds = from_tensors(features, labels);
+    REQUIRE_EQ(ds.size(), 3u);
+    REQUIRE_EQ(ds.num_features(), 4u);
+    REQUIRE_EQ(ds.feature_shape().size(), 2u);
+    REQUIRE_EQ(ds.feature_shape()[0], 2u);
+    REQUIRE_EQ(ds.feature_shape()[1], 2u);
+    REQUIRE_EQ(ds.num_classes(), 2u);
+
+    auto [x, y] = ds.batch({1});
+    REQUIRE_EQ(x.rank(), 3u);
+    REQUIRE_EQ(x.data()[0], 5.0f);
+    REQUIRE_EQ(x.data()[3], 8.0f);
+    REQUIRE_EQ(y.data()[0], 1);
+}
+
+TEST(dataset, from_tensor_collection) {
+    // one tensor per sample stacked along a new leading axis
+    std::vector<Tensor<float>> samples = {
+        Tensor<float>::from_values({1, 2, 3, 4}),
+        Tensor<float>::from_values({5, 6, 7, 8}),
+    };
+    std::vector<int> labels = {2, 5};
+
+    auto ds = from_tensors(samples, labels, {"a", "b", "c", "d", "e", "f"});
+    REQUIRE_EQ(ds.size(), 2u);
+    REQUIRE_EQ(ds.num_features(), 4u);
+    REQUIRE_EQ(ds.num_classes(), 6u);
+
+    auto [x, y] = ds.batch({0, 1});
+    REQUIRE_EQ(x.shape()[0], 2u);
+    REQUIRE_EQ(x.shape()[1], 4u);
+    REQUIRE_EQ(x.data()[4], 5.0f);
+    REQUIRE_EQ(y.data()[1], 5);
+}
+
+TEST(dataset, from_tensors_size_mismatch_throws) {
+    std::vector<Tensor<float>> samples = {
+        Tensor<float>::from_values({1, 2}),
+    };
+    std::vector<int> labels = {0, 1};
+    REQUIRE_THROWS(from_tensors(samples, labels));
+}
+
+TEST(dataset, to_cuda_batches_match_cpu) {
+    auto cpu_ds = make_synthetic();
+
+    auto gpu_ds = make_synthetic();
+    gpu_ds.to_cuda();
+    REQUIRE_EQ((int)gpu_ds.device(), (int)Device::CUDA);
+
+    std::vector<Index> idx = {5, 0, 17, 3};
+
+    auto [xc, yc] = cpu_ds.batch(idx);
+    auto [xg, yg] = gpu_ds.batch(idx, Device::CUDA);
+    REQUIRE_EQ((int)xg.device(), (int)Device::CUDA);
+
+    auto xg_host = xg.to_cpu();
+    for (Index i = 0; i < xc.size(); ++i) {
+        REQUIRE_CLOSE(xc.data()[i], xg_host.data()[i], 1e-6);
+    }
+    for (Index i = 0; i < yc.size(); ++i) {
+        REQUIRE_EQ(yc.data()[i], yg.data()[i]);
+    }
+
+    // a gpu resident dataset can still hand back cpu batches
+    auto [xg_cpu, _] = gpu_ds.batch(idx, Device::CPU);
+    REQUIRE_EQ((int)xg_cpu.device(), (int)Device::CPU);
+    for (Index i = 0; i < xc.size(); ++i) {
+        REQUIRE_CLOSE(xc.data()[i], xg_cpu.data()[i], 1e-6);
+    }
+}
+
+TEST(dataset, normalise_on_cuda) {
+    auto ds = make_synthetic();
+    ds.to_cuda();
+    ds.normalise();
+    ds.to_cpu();
+
+    // each normalised feature column should have zero mean
+    Index N = ds.size();
+    std::vector<Index> all(N);
+    for (Index i = 0; i < N; ++i) all[i] = i;
+    auto [x, _] = ds.batch(all);
+
+    for (Index j = 0; j < ds.num_features(); ++j) {
+        float s = 0.0f;
+        for (Index n = 0; n < N; ++n) s += x.data()[n * ds.num_features() + j];
+        REQUIRE_CLOSE(s / (float)N, 0.0f, 1e-4);
+    }
+}
 
 TEST(dataset, csv_roundtrip) {
     auto ds = make_synthetic();

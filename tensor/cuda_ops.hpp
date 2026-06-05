@@ -6,7 +6,20 @@
 
 namespace cue::cuda {
 
-    //  raw memory 
+    constexpr int MAX_DIMS = 8;
+
+    enum class BinOp { Add, Sub, Mul, Div };
+
+    // shapes and per input strides describing a broadcasted binary op the output
+    // is row major contiguous strides are 0 on broadcast axes
+    struct BroadcastDims {
+        int    rank;
+        size_t out_shape[MAX_DIMS];
+        size_t a_stride[MAX_DIMS];
+        size_t b_stride[MAX_DIMS];
+    };
+
+    //  raw memory
 
     void* malloc_bytes(size_t bytes);
     void  free_bytes(void* ptr);
@@ -24,6 +37,8 @@ namespace cue::cuda {
     void div(const float* a, const float* b, float* out, size_t n);
     void add_scalar(const float* a, float s, float* out, size_t n);
     void mul_scalar(const float* a, float s, float* out, size_t n);
+    void broadcast_binop(const float* a, const float* b, float* out, size_t n,
+                         const BroadcastDims& dims, BinOp op);
 
     //  activations 
 //
@@ -83,4 +98,11 @@ namespace cue::cuda {
     void sum_to_channel(const float* in, float* out,
                         size_t N, size_t C, size_t HW);
     void sum_axis0(const float* in, float* out, size_t N, size_t M);
+
+    //  indexing
+
+    // copy n rows each per_sample floats from src into out selected by a
+    // host side index array
+    void gather_rows(const float* src, const size_t* indices, float* out,
+                     size_t n, size_t per_sample);
 }

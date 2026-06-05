@@ -9,6 +9,7 @@
 namespace {
 
 constexpr int THREADS = 256;
+constexpr int TILE = 16;
 
 inline void cuda_check(cudaError_t err, const char *what) {
   if (err != cudaSuccess) {
@@ -57,6 +58,34 @@ __global__ void mul_scalar_k(const float *a, float s, float *out, size_t n) {
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n)
     out[i] = a[i] * s;
+}
+
+// each output element decodes its coordinates from the flat index then walks the
+// per input strides which are 0 on broadcast axes so a size 1 dim reads the same
+// element repeatedly
+__global__ void broadcast_binop_k(const float *a, const float *b, float *out,
+                                  size_t n, cue::cuda::BroadcastDims d, int op) {
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n)
+    return;
+
+  size_t rem = idx, a_off = 0, b_off = 0;
+  for (int i = d.rank - 1; i >= 0; --i) {
+    size_t coord = rem % d.out_shape[i];
+    rem /= d.out_shape[i];
+    a_off += coord * d.a_stride[i];
+    b_off += coord * d.b_stride[i];
+  }
+
+  float av = a[a_off], bv = b[b_off];
+  float r = 0.0f;
+  switch (op) {
+  case 0: r = av + bv; break;
+  case 1: r = av - bv; break;
+  case 2: r = av * bv; break;
+  case 3: r = av / bv; break;
+  }
+  out[idx] = r;
 }
 
 // activations
@@ -147,27 +176,55 @@ __global__ void softmax_last_dim_k(const float *in, float *out, size_t outer,
 }
 
 // linear algebra
+
+// tiled matmul each block loads a TILE x TILE square of A and B into shared
+// memory and reuses it across the inner product so global memory is read once
+// per tile instead of once per multiply
 __global__ void matmul_k(const float *A, const float *B, float *C, size_t M,
                          size_t K, size_t N) {
-  size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-  size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= M || col >= N)
-    return;
+  __shared__ float As[TILE][TILE];
+  __shared__ float Bs[TILE][TILE];
+
+  size_t row = (size_t)blockIdx.y * TILE + threadIdx.y;
+  size_t col = (size_t)blockIdx.x * TILE + threadIdx.x;
 
   float acc = 0.0f;
-  for (size_t k = 0; k < K; ++k) {
-    acc += A[row * K + k] * B[k * N + col];
+  size_t tiles = (K + TILE - 1) / TILE;
+  for (size_t t = 0; t < tiles; ++t) {
+    size_t a_col = t * TILE + threadIdx.x;
+    size_t b_row = t * TILE + threadIdx.y;
+    As[threadIdx.y][threadIdx.x] =
+        (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
+    Bs[threadIdx.y][threadIdx.x] =
+        (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
+    __syncthreads();
+
+    for (int k = 0; k < TILE; ++k)
+      acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+    __syncthreads();
   }
-  C[row * N + col] = acc;
+
+  if (row < M && col < N)
+    C[row * N + col] = acc;
 }
 
+// tiled transpose stages a TILE x TILE block in shared memory so both the read
+// and the write to global memory are coalesced the +1 pads each row to avoid
+// shared memory bank conflicts
 __global__ void transpose2d_k(const float *in, float *out, size_t rows,
                               size_t cols) {
-  size_t i = blockIdx.y * blockDim.y + threadIdx.y;
-  size_t j = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= rows || j >= cols)
-    return;
-  out[j * rows + i] = in[i * cols + j];
+  __shared__ float tile[TILE][TILE + 1];
+
+  size_t x = (size_t)blockIdx.x * TILE + threadIdx.x;
+  size_t y = (size_t)blockIdx.y * TILE + threadIdx.y;
+  if (x < cols && y < rows)
+    tile[threadIdx.y][threadIdx.x] = in[y * cols + x];
+  __syncthreads();
+
+  size_t tx = (size_t)blockIdx.y * TILE + threadIdx.x;
+  size_t ty = (size_t)blockIdx.x * TILE + threadIdx.y;
+  if (tx < rows && ty < cols)
+    out[ty * rows + tx] = tile[threadIdx.x][threadIdx.y];
 }
 
 // reductions
@@ -334,6 +391,16 @@ __global__ void sum_axis0_k(const float *in, float *out, size_t N, size_t M) {
   for (size_t i = 0; i < N; ++i)
     acc += in[i * M + j];
   out[j] = acc;
+}
+
+__global__ void gather_rows_k(const float *src, const size_t *idx, float *out,
+                              size_t n, size_t per_sample) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n * per_sample)
+    return;
+  size_t row = t / per_sample;
+  size_t col = t % per_sample;
+  out[t] = src[idx[row] * per_sample + col];
 }
 
 // conv2d / pool backwards
@@ -572,6 +639,13 @@ void mul_scalar(const float *a, float s, float *out, size_t n) {
   cuda_check(cudaGetLastError(), "mul_scalar");
 }
 
+void broadcast_binop(const float *a, const float *b, float *out, size_t n,
+                     const BroadcastDims &dims, BinOp op) {
+  broadcast_binop_k<<<grid_size(n, THREADS), THREADS>>>(a, b, out, n, dims,
+                                                        (int)op);
+  cuda_check(cudaGetLastError(), "broadcast_binop");
+}
+
 // activations
 
 void relu(const float *a, float *out, size_t n) {
@@ -614,17 +688,15 @@ void softmax_last_dim(const float *in, float *out, size_t outer, size_t inner) {
 // linear algebra
 void matmul(const float *a, const float *b, float *out, size_t m, size_t k,
             size_t n) {
-  dim3 block(16, 16);
-  dim3 grid(static_cast<unsigned>((n + 15) / 16),
-            static_cast<unsigned>((m + 15) / 16));
+  dim3 block(TILE, TILE);
+  dim3 grid(grid_size(n, TILE), grid_size(m, TILE));
   matmul_k<<<grid, block>>>(a, b, out, m, k, n);
   cuda_check(cudaGetLastError(), "matmul");
 }
 
 void transpose2d(const float *a, float *out, size_t rows, size_t cols) {
-  dim3 block(16, 16);
-  dim3 grid(static_cast<unsigned>((cols + 15) / 16),
-            static_cast<unsigned>((rows + 15) / 16));
+  dim3 block(TILE, TILE);
+  dim3 grid(grid_size(cols, TILE), grid_size(rows, TILE));
   transpose2d_k<<<grid, block>>>(a, out, rows, cols);
   cuda_check(cudaGetLastError(), "transpose2d");
 }
@@ -759,6 +831,23 @@ void sum_to_channel(const float *in, float *out, size_t N, size_t C,
 void sum_axis0(const float *in, float *out, size_t N, size_t M) {
   sum_axis0_k<<<grid_size(M, THREADS), THREADS>>>(in, out, N, M);
   cuda_check(cudaGetLastError(), "sum_axis0");
+}
+
+void gather_rows(const float *src, const size_t *indices, float *out,
+                 size_t n, size_t per_sample) {
+  if (n == 0 || per_sample == 0)
+    return;
+  size_t *idx_dev = nullptr;
+  cuda_check(cudaMalloc(&idx_dev, n * sizeof(size_t)), "gather_rows alloc");
+  cuda_check(cudaMemcpy(idx_dev, indices, n * sizeof(size_t),
+                        cudaMemcpyHostToDevice),
+             "gather_rows copy");
+  size_t total = n * per_sample;
+  gather_rows_k<<<grid_size(total, THREADS), THREADS>>>(src, idx_dev, out, n,
+                                                        per_sample);
+  cudaError_t err = cudaGetLastError();
+  cudaFree(idx_dev);
+  cuda_check(err, "gather_rows");
 }
 
 } // namespace cue::cuda

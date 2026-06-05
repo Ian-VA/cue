@@ -833,8 +833,12 @@ class Tensor {
         enum class Op { Add, Sub, Mul, Div };
 
         Tensor<Val> elementwise(const Tensor<Val>& other, Op op) const {
-            check_same_shape(other);
             check_same_device(other);
+
+            // shapes differ but are broadcast compatible take the general path
+            if (_shape != other._shape) {
+                return broadcast_elementwise(other, op);
+            }
 
             Tensor<Val> out(_shape, _device);
             Index n = size();
@@ -859,6 +863,92 @@ class Tensor {
                     case Op::Mul: cue::cuda::mul(a, b, o, n); break;
                     case Op::Div: cue::cuda::div(a, b, o, n); break;
                 }
+            }
+            return out;
+        }
+
+        // numpy style broadcasting align shapes from the right a dim is
+        // compatible if equal or one of them is 1 the size 1 dim is stretched
+        static std::vector<Index> broadcast_shape(const std::vector<Index>& a,
+                                                  const std::vector<Index>& b) {
+            Index r  = std::max(a.size(), b.size());
+            Index pa = r - a.size();
+            Index pb = r - b.size();
+            std::vector<Index> out(r);
+            for (Index i = 0; i < r; ++i) {
+                Index ad = i < pa ? 1 : a[i - pa];
+                Index bd = i < pb ? 1 : b[i - pb];
+                if (ad != bd && ad != 1 && bd != 1) {
+                    throw std::invalid_argument("Tensor shapes are not broadcastable");
+                }
+                out[i] = std::max(ad, bd);
+            }
+            return out;
+        }
+
+        // row major strides for shape left padded to out_rank with 0 on any axis
+        // that is broadcast (size 1 or missing) so it reads one element repeatedly
+        static std::vector<Index> broadcast_strides(const std::vector<Index>& shape,
+                                                    Index out_rank) {
+            Index r = shape.size();
+            std::vector<Index> stride(r, 1);
+            Index p = 1;
+            for (int i = (int)r - 1; i >= 0; --i) { stride[i] = p; p *= shape[i]; }
+            std::vector<Index> out(out_rank, 0);
+            for (Index i = 0; i < r; ++i) {
+                out[out_rank - r + i] = shape[i] == 1 ? 0 : stride[i];
+            }
+            return out;
+        }
+
+        Tensor<Val> broadcast_elementwise(const Tensor<Val>& other, Op op) const {
+            std::vector<Index> out_shape = broadcast_shape(_shape, other._shape);
+            Index out_rank = out_shape.size();
+            std::vector<Index> a_stride = broadcast_strides(_shape, out_rank);
+            std::vector<Index> b_stride = broadcast_strides(other._shape, out_rank);
+
+            Tensor<Val> out(out_shape, _device);
+            Index n = out.size();
+
+            if (_device == Device::CPU) {
+                const Val* a = _storage->data();
+                const Val* b = other._storage->data();
+                Val*       o = out._storage->data();
+                for (Index idx = 0; idx < n; ++idx) {
+                    Index rem = idx, a_off = 0, b_off = 0;
+                    for (int i = (int)out_rank - 1; i >= 0; --i) {
+                        Index coord = rem % out_shape[i];
+                        rem        /= out_shape[i];
+                        a_off      += coord * a_stride[i];
+                        b_off      += coord * b_stride[i];
+                    }
+                    switch (op) {
+                        case Op::Add: o[idx] = a[a_off] + b[b_off]; break;
+                        case Op::Sub: o[idx] = a[a_off] - b[b_off]; break;
+                        case Op::Mul: o[idx] = a[a_off] * b[b_off]; break;
+                        case Op::Div: o[idx] = a[a_off] / b[b_off]; break;
+                    }
+                }
+            } else if constexpr (std::is_same_v<Val, float>) {
+                if (out_rank > cue::cuda::MAX_DIMS) {
+                    throw std::invalid_argument("broadcast rank exceeds CUDA MAX_DIMS");
+                }
+                cue::cuda::BroadcastDims d{};
+                d.rank = (int)out_rank;
+                for (Index i = 0; i < out_rank; ++i) {
+                    d.out_shape[i] = out_shape[i];
+                    d.a_stride[i]  = a_stride[i];
+                    d.b_stride[i]  = b_stride[i];
+                }
+                cue::cuda::BinOp cop = cue::cuda::BinOp::Add;
+                switch (op) {
+                    case Op::Add: cop = cue::cuda::BinOp::Add; break;
+                    case Op::Sub: cop = cue::cuda::BinOp::Sub; break;
+                    case Op::Mul: cop = cue::cuda::BinOp::Mul; break;
+                    case Op::Div: cop = cue::cuda::BinOp::Div; break;
+                }
+                cue::cuda::broadcast_binop(_storage->data(), other._storage->data(),
+                                           out._storage->data(), n, d, cop);
             }
             return out;
         }

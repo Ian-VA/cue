@@ -36,3 +36,6 @@ endforeach()
 
 target_compile_definitions(test_train_iris
     PRIVATE CUE_DATA_DIR="${CMAKE_SOURCE_DIR}/data")
+
+add_executable(bench bench/bench.cpp)
+target_link_libraries(bench PRIVATE cue)

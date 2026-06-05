@@ -78,23 +78,33 @@ CsvTable read_csv(const std::string& path, char delim, bool has_header) {
     return table;
 }
 
-// Dataset
+// dataset
 
 Dataset::Dataset(std::vector<float>       features,
                  std::vector<int>         labels,
                  std::vector<Index>       feature_shape,
                  std::vector<std::string> class_names)
-        : _features(std::move(features)),
-          _labels(std::move(labels)),
+        : _labels(std::move(labels)),
           _feature_shape(std::move(feature_shape)),
           _class_names(std::move(class_names)) {
     _per_sample = shape_product(_feature_shape);
     if (_per_sample == 0) {
         throw std::invalid_argument("feature_shape must be non-empty");
     }
-    if (_features.size() != _per_sample * _labels.size()) {
+    if (features.size() != _per_sample * _labels.size()) {
         throw std::invalid_argument("features and labels size mismatch");
     }
+
+    std::vector<Index> buffer_shape = {_labels.size()};
+    buffer_shape.insert(buffer_shape.end(),
+                        _feature_shape.begin(), _feature_shape.end());
+    _features = Tensor<float>(buffer_shape, Device::CPU);
+    std::copy(features.begin(), features.end(), _features.data());
+}
+
+Dataset& Dataset::to(Device device) {
+    _features = _features.to(device);
+    return *this;
 }
 
 Index Dataset::num_classes() const {
@@ -109,16 +119,27 @@ Tensor<float> Dataset::gather_features(const std::vector<Index>& indices,
     std::vector<Index> out_shape = {indices.size()};
     out_shape.insert(out_shape.end(), _feature_shape.begin(), _feature_shape.end());
 
-    Tensor<float> cpu(out_shape, Device::CPU);
-    for (Index i = 0; i < indices.size(); ++i) {
-        Index src = indices[i] * _per_sample;
-        if (src + _per_sample > _features.size()) {
+    for (Index idx : indices) {
+        if ((idx + 1) * _per_sample > _features.size()) {
             throw std::out_of_range("gather index past end of features");
         }
-        std::copy_n(_features.data() + src, _per_sample,
-                    cpu.data() + i * _per_sample);
     }
-    return device == Device::CPU ? cpu : cpu.to_cuda();
+
+    // gather on whichever device the feature buffer lives then move the result
+    // to the device the caller asked for
+    if (_features.device() == Device::CPU) {
+        Tensor<float> out(out_shape, Device::CPU);
+        for (Index i = 0; i < indices.size(); ++i) {
+            std::copy_n(_features.data() + indices[i] * _per_sample, _per_sample,
+                        out.data() + i * _per_sample);
+        }
+        return out.to(device);
+    }
+
+    Tensor<float> out(out_shape, Device::CUDA);
+    cue::cuda::gather_rows(_features.data(), indices.data(), out.data(),
+                           indices.size(), _per_sample);
+    return out.to(device);
 }
 
 Tensor<int> Dataset::gather_labels(const std::vector<Index>& indices) const {
@@ -139,19 +160,22 @@ Dataset::batch(const std::vector<Index>& indices, Device device) const {
 
 std::pair<std::vector<float>, std::vector<float>> Dataset::normalise() {
     Index N = _labels.size();
+    Tensor<float> host = _features.to_cpu();
+    const float*  data = host.data();
+
     std::vector<float> mean(_per_sample, 0.0f);
     std::vector<float> var(_per_sample,  0.0f);
 
     for (Index n = 0; n < N; ++n) {
         for (Index j = 0; j < _per_sample; ++j) {
-            mean[j] += _features[n * _per_sample + j];
+            mean[j] += data[n * _per_sample + j];
         }
     }
     for (auto& m : mean) m /= (float)N;
 
     for (Index n = 0; n < N; ++n) {
         for (Index j = 0; j < _per_sample; ++j) {
-            float d = _features[n * _per_sample + j] - mean[j];
+            float d = data[n * _per_sample + j] - mean[j];
             var[j] += d * d;
         }
     }
@@ -170,16 +194,20 @@ void Dataset::apply_normalisation(const std::vector<float>& mean,
     if (mean.size() != _per_sample || stddev.size() != _per_sample) {
         throw std::invalid_argument("normalisation stats size mismatch");
     }
-    Index N = _labels.size();
+    Device        device = _features.device();
+    Tensor<float> host   = _features.to_cpu().clone();
+    float*        data   = host.data();
+    Index         N      = _labels.size();
     for (Index n = 0; n < N; ++n) {
         for (Index j = 0; j < _per_sample; ++j) {
-            _features[n * _per_sample + j] =
-                (_features[n * _per_sample + j] - mean[j]) / stddev[j];
+            data[n * _per_sample + j] =
+                (data[n * _per_sample + j] - mean[j]) / stddev[j];
         }
     }
+    _features = host.to(device);
 }
 
-// CSV to Dataset
+// csv to dataset
 
 Dataset from_csv(const CsvTable& table, const std::vector<Index>& feature_shape) {
     if (table.rows.empty()) {
@@ -230,7 +258,65 @@ Dataset from_csv(const CsvTable& table, const std::vector<Index>& feature_shape)
                    feature_shape, std::move(class_names));
 }
 
-// DataLoader
+// tensors to dataset
+
+Dataset from_tensors(const Tensor<float>& features, const Tensor<int>& labels,
+                     std::vector<std::string> class_names) {
+    if (features.rank() < 2) {
+        throw std::invalid_argument(
+            "from_tensors: features must have rank >= 2 (sample axis + feature dims)");
+    }
+
+    Tensor<float> feat_cpu = features.to_cpu();
+    Tensor<int>   lab_cpu  = labels.to_cpu();
+
+    Index N = feat_cpu.shape()[0];
+    if (lab_cpu.size() != N) {
+        throw std::invalid_argument("from_tensors: label count must match sample count");
+    }
+
+    std::vector<Index> feature_shape(feat_cpu.shape().begin() + 1,
+                                     feat_cpu.shape().end());
+
+    std::vector<float> flat_features(feat_cpu.data(), feat_cpu.data() + feat_cpu.size());
+    std::vector<int>   flat_labels(lab_cpu.data(), lab_cpu.data() + lab_cpu.size());
+
+    return Dataset(std::move(flat_features), std::move(flat_labels),
+                   std::move(feature_shape), std::move(class_names));
+}
+
+Dataset from_tensors(const std::vector<Tensor<float>>& samples,
+                     const std::vector<int>&           labels,
+                     std::vector<std::string>          class_names) {
+    if (samples.empty()) {
+        throw std::invalid_argument("from_tensors: sample collection is empty");
+    }
+    if (samples.size() != labels.size()) {
+        throw std::invalid_argument("from_tensors: label count must match sample count");
+    }
+
+    const std::vector<Index>& feature_shape = samples.front().shape();
+    Index per_sample = shape_product(feature_shape);
+    if (per_sample == 0) {
+        throw std::invalid_argument("from_tensors: samples must be non-empty");
+    }
+
+    std::vector<float> flat_features;
+    flat_features.reserve(samples.size() * per_sample);
+
+    for (const auto& sample : samples) {
+        if (sample.shape() != feature_shape) {
+            throw std::invalid_argument("from_tensors: all samples must share the same shape");
+        }
+        Tensor<float> cpu = sample.to_cpu();
+        flat_features.insert(flat_features.end(), cpu.data(), cpu.data() + cpu.size());
+    }
+
+    return Dataset(std::move(flat_features), labels,
+                   feature_shape, std::move(class_names));
+}
+
+// dataloader
 
 DataLoader::DataLoader(const Dataset& dataset, Index batch_size, bool shuffle,
                        uint64_t seed, Device device)

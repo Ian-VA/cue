@@ -269,6 +269,54 @@ TEST(elementwise, shape_mismatch_throws) {
     REQUIRE_THROWS(a + b);
 }
 
+TEST(broadcast, row_vector_over_matrix) {
+    // (2,3) + (3,) -> (2,3) the vector is reused across rows
+    auto a = Tensor<float>::from_values({{1, 2, 3}, {4, 5, 6}});
+    auto b = Tensor<float>::from_values({10, 20, 30});
+    auto c = a + b;
+    REQUIRE_EQ(c.rank(), 2u);
+    REQUIRE_EQ(c.shape()[0], 2u);
+    REQUIRE_EQ(c.shape()[1], 3u);
+    expect_tensor_close(c, {11, 22, 33, 14, 25, 36}, 1e-6, "row bcast");
+}
+
+TEST(broadcast, column_vector_over_matrix) {
+    // (2,3) * (2,1) -> (2,3) the column scales each row
+    auto a = Tensor<float>::from_values({{1, 2, 3}, {4, 5, 6}});
+    Tensor<float> b(std::vector<Index>{2, 1});
+    b.data()[0] = 2.0f;
+    b.data()[1] = 3.0f;
+    auto c = a * b;
+    expect_tensor_close(c, {2, 4, 6, 12, 15, 18}, 1e-6, "col bcast");
+}
+
+TEST(broadcast, rank_extension) {
+    // (2,2) - (1,) extends the smaller operand on the left
+    auto a = Tensor<float>::from_values({{5, 6}, {7, 8}});
+    Tensor<float> b(std::vector<Index>{1});
+    b.data()[0] = 1.0f;
+    auto c = a - b;
+    expect_tensor_close(c, {4, 5, 6, 7}, 1e-6, "rank ext");
+}
+
+TEST(broadcast, incompatible_throws) {
+    auto a = Tensor<float>::from_values({{1, 2, 3}});
+    auto b = Tensor<float>::from_values({1, 2});
+    REQUIRE_THROWS(a + b);
+}
+
+TEST(broadcast, cuda_matches_cpu) {
+    auto a = Tensor<float>::from_values({{1, 2, 3}, {4, 5, 6}});
+    auto b = Tensor<float>::from_values({10, 20, 30});
+    auto cpu = a + b;
+    auto gpu = a.to_cuda() + b.to_cuda();
+    REQUIRE_EQ((int)gpu.device(), (int)Device::CUDA);
+    expect_tensor_close(gpu, {11, 22, 33, 14, 25, 36}, 1e-6, "cuda bcast");
+    expect_tensor_close(gpu.to_cpu(), {cpu.data()[0], cpu.data()[1], cpu.data()[2],
+                                       cpu.data()[3], cpu.data()[4], cpu.data()[5]},
+                        1e-6, "cuda vs cpu");
+}
+
 TEST(elementwise, neg) {
     auto a = Tensor<float>::from_values({1, -2, 3});
     auto n = -a;

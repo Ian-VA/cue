@@ -17,7 +17,9 @@ struct CsvTable {
 CsvTable read_csv(const std::string& path,
                   char delim = ',', bool has_header = true);
 
-// In-memory dataset of (features, label) pairs. Features are a flat row-major buffer while labels are integer class ids
+// in-memory dataset of feature label pairs the feature buffer is held as a
+// single (n, *feature_shape) tensor and can live on the cpu or the gpu labels
+// are integer class ids kept on the host
 class Dataset {
     public:
         Dataset(std::vector<float>        features,
@@ -32,7 +34,15 @@ class Dataset {
         const std::vector<Index>&       feature_shape() const { return _feature_shape; }
         const std::vector<std::string>& class_names()   const { return _class_names; }
 
-        // Build a contiguous (n, *feature_shape) tensor from selected indices.
+        // where the feature buffer currently lives
+        Device device() const { return _features.device(); }
+
+        // move the whole feature buffer to a device returns *this for chaining
+        Dataset& to(Device device);
+        Dataset& to_cuda() { return to(Device::CUDA); }
+        Dataset& to_cpu()  { return to(Device::CPU); }
+
+        // build a contiguous (n, *feature_shape) tensor from selected indices
         Tensor<float> gather_features(const std::vector<Index>& indices,
                                       Device device = Device::CPU) const;
         Tensor<int>   gather_labels(const std::vector<Index>& indices) const;
@@ -41,24 +51,34 @@ class Dataset {
             batch(const std::vector<Index>& indices,
                   Device device = Device::CPU) const;
 
-        // Z-score normalise each feature column using statistics computed from this dataset. Returns (mean, std)
+        // z-score normalise each feature column returns mean and std
         std::pair<std::vector<float>, std::vector<float>> normalise();
         void apply_normalisation(const std::vector<float>& mean,
                                  const std::vector<float>& stddev);
 
     private:
-        std::vector<float>       _features;
+        Tensor<float>            _features;
         std::vector<int>         _labels;
         std::vector<Index>       _feature_shape;
         std::vector<std::string> _class_names;
         Index                    _per_sample {0};
 };
 
-// Build a Dataset from a CSV table. The last column is treated as the class
-// label while remaining columns are parsed as floats. Class strings are mapped to
-// integer ids in first-seen order.
+// build a dataset from a csv table the last column is the class label the rest
+// are parsed as floats class strings get integer ids in first seen order
 Dataset from_csv(const CsvTable& table,
                  const std::vector<Index>& feature_shape);
+
+// build a dataset from a stacked (n, *feature_shape) tensor and a length n label
+// tensor the leading dim is the sample axis
+Dataset from_tensors(const Tensor<float>& features,
+                     const Tensor<int>&   labels,
+                     std::vector<std::string> class_names = {});
+
+// build a dataset from one tensor per sample stacked along a new leading axis
+Dataset from_tensors(const std::vector<Tensor<float>>& samples,
+                     const std::vector<int>&           labels,
+                     std::vector<std::string>          class_names = {});
 
 class DataLoader {
     public:
