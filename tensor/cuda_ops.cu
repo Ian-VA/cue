@@ -1,15 +1,19 @@
 #include "cuda_ops.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace {
 
 constexpr int THREADS = 256;
 constexpr int TILE = 16;
+// upper bound on the grid for the grid-stride kernels: enough blocks to fill a
+// modern GPU while keeping the launch resident so each thread amortises its
+// setup over several elements on large tensors
+constexpr int MAX_BLOCKS = 4096;
 
 inline void cuda_check(cudaError_t err, const char *what) {
   if (err != cudaSuccess) {
@@ -23,42 +27,123 @@ inline int grid_size(size_t n, int block) {
 }
 
 // element-wise operations
+//
+// Element-wise and activation kernels are bandwidth-bound, so they share two
+// launch helpers below. Both use a grid-stride loop (the launch is decoupled
+// from the problem size, so a capped grid stays resident and each thread
+// amortises its setup over several elements) and, when every buffer is 16-byte
+// aligned, a float4 path that moves 128 bits per thread per memory transaction
+// instead of 32. A scalar kernel mops up the < 4 element tail.
 
-__global__ void add_k(const float *a, const float *b, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = a[i] + b[i];
+template <class Op>
+__global__ void unary_vec_k(const float4 *a, float4 *out, size_t n4, Op op) {
+  size_t stride = (size_t)gridDim.x * blockDim.x;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+       i += stride) {
+    float4 v = a[i];
+    out[i] = make_float4(op(v.x), op(v.y), op(v.z), op(v.w));
+  }
 }
 
-__global__ void sub_k(const float *a, const float *b, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = a[i] - b[i];
+template <class Op>
+__global__ void unary_scalar_k(const float *a, float *out, size_t n, Op op) {
+  size_t stride = (size_t)gridDim.x * blockDim.x;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += stride)
+    out[i] = op(a[i]);
 }
 
-__global__ void mul_k(const float *a, const float *b, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = a[i] * b[i];
+template <class Op>
+__global__ void binary_vec_k(const float4 *a, const float4 *b, float4 *out,
+                             size_t n4, Op op) {
+  size_t stride = (size_t)gridDim.x * blockDim.x;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+       i += stride) {
+    float4 x = a[i], y = b[i];
+    out[i] =
+        make_float4(op(x.x, y.x), op(x.y, y.y), op(x.z, y.z), op(x.w, y.w));
+  }
 }
 
-__global__ void div_k(const float *a, const float *b, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = a[i] / b[i];
+template <class Op>
+__global__ void binary_scalar_k(const float *a, const float *b, float *out,
+                                size_t n, Op op) {
+  size_t stride = (size_t)gridDim.x * blockDim.x;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += stride)
+    out[i] = op(a[i], b[i]);
 }
 
-__global__ void add_scalar_k(const float *a, float s, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = a[i] + s;
+inline bool aligned16(const void *p) {
+  return (reinterpret_cast<uintptr_t>(p) & 0xF) == 0;
 }
 
-__global__ void mul_scalar_k(const float *a, float s, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = a[i] * s;
+inline int capped_blocks(size_t units) {
+  int b = grid_size(units, THREADS);
+  if (b < 1)
+    b = 1;
+  return b < MAX_BLOCKS ? b : MAX_BLOCKS;
 }
+
+template <class Op>
+inline void launch_unary(const float *a, float *out, size_t n, Op op) {
+  if (n == 0)
+    return;
+  size_t n4 = n / 4;
+  if (n4 && aligned16(a) && aligned16(out)) {
+    unary_vec_k<<<capped_blocks(n4), THREADS>>>(
+        reinterpret_cast<const float4 *>(a), reinterpret_cast<float4 *>(out),
+        n4, op);
+    size_t done = n4 * 4;
+    if (done < n)
+      unary_scalar_k<<<1, THREADS>>>(a + done, out + done, n - done, op);
+  } else {
+    unary_scalar_k<<<capped_blocks(n), THREADS>>>(a, out, n, op);
+  }
+}
+
+template <class Op>
+inline void launch_binary(const float *a, const float *b, float *out, size_t n,
+                          Op op) {
+  if (n == 0)
+    return;
+  size_t n4 = n / 4;
+  if (n4 && aligned16(a) && aligned16(b) && aligned16(out)) {
+    binary_vec_k<<<capped_blocks(n4), THREADS>>>(
+        reinterpret_cast<const float4 *>(a),
+        reinterpret_cast<const float4 *>(b), reinterpret_cast<float4 *>(out),
+        n4, op);
+    size_t done = n4 * 4;
+    if (done < n)
+      binary_scalar_k<<<1, THREADS>>>(a + done, b + done, out + done, n - done,
+                                      op);
+  } else {
+    binary_scalar_k<<<capped_blocks(n), THREADS>>>(a, b, out, n, op);
+  }
+}
+
+// functors fed to the launch helpers above
+
+struct AddOp {
+  __device__ float operator()(float a, float b) const { return a + b; }
+};
+struct SubOp {
+  __device__ float operator()(float a, float b) const { return a - b; }
+};
+struct MulOp {
+  __device__ float operator()(float a, float b) const { return a * b; }
+};
+struct DivOp {
+  __device__ float operator()(float a, float b) const { return a / b; }
+};
+struct AddScalarOp {
+  float s;
+  __device__ float operator()(float a) const { return a + s; }
+};
+struct MulScalarOp {
+  float s;
+  __device__ float operator()(float a) const { return a * s; }
+};
 
 // each output element decodes its coordinates from the flat index then walks the
 // per input strides which are 0 on broadcast axes so a size 1 dim reads the same
@@ -88,46 +173,31 @@ __global__ void broadcast_binop_k(const float *a, const float *b, float *out,
   out[idx] = r;
 }
 
-// activations
+// activations (run through the launch helpers above via these functors)
 
-__global__ void relu_k(const float *a, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    float v = a[i];
-    out[i] = v > 0.0f ? v : 0.0f;
+struct ReluOp {
+  __device__ float operator()(float a) const { return a > 0.0f ? a : 0.0f; }
+};
+struct ReluBackOp {
+  // a = upstream gradient, b = the layer input that produced this element
+  __device__ float operator()(float a, float b) const {
+    return b > 0.0f ? a : 0.0f;
   }
-}
-
-__global__ void relu_backward_k(const float *grad, const float *input,
-                                float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = input[i] > 0.0f ? grad[i] : 0.0f;
-}
-
-__global__ void sigmoid_k(const float *a, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = 1.0f / (1.0f + __expf(-a[i]));
-}
-
-__global__ void tanh_k(const float *a, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = tanhf(a[i]);
-}
-
-__global__ void exp_k(const float *a, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = expf(a[i]);
-}
-
-__global__ void log_k(const float *a, float *out, size_t n) {
-  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n)
-    out[i] = logf(a[i]);
-}
+};
+struct SigmoidOp {
+  __device__ float operator()(float a) const {
+    return 1.0f / (1.0f + __expf(-a));
+  }
+};
+struct TanhOp {
+  __device__ float operator()(float a) const { return tanhf(a); }
+};
+struct ExpOp {
+  __device__ float operator()(float a) const { return expf(a); }
+};
+struct LogOp {
+  __device__ float operator()(float a) const { return logf(a); }
+};
 
 // binary tree reduction sums
 __global__ void softmax_last_dim_k(const float *in, float *out, size_t outer,
@@ -229,27 +299,40 @@ __global__ void transpose2d_k(const float *in, float *out, size_t rows,
 
 // reductions
 
-__global__ void sum_partial_k(const float *in, float *partials, size_t n) {
-  extern __shared__ float sdata[];
-  size_t tid = threadIdx.x;
-  size_t i = blockIdx.x * (blockDim.x * 2) + tid;
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+  for (int offset = 16; offset > 0; offset >>= 1)
+    v += __shfl_down_sync(0xffffffffu, v, offset);
+  return v;
+}
 
+// Grid-stride accumulate into a register, then a two-level block reduction:
+// a warp-shuffle reduce within each warp (no shared memory, no divergence),
+// one shared exchange of per-warp totals, and a final warp-shuffle reduce.
+// Each block writes one partial; running the kernel again over the partials
+// with a single block finishes the whole reduction on the GPU, so only one
+// float is ever copied back to the host.
+__global__ void reduce_sum_k(const float *in, float *out, size_t n) {
   float v = 0.0f;
-  if (i < n)
+  size_t stride = (size_t)gridDim.x * blockDim.x;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += stride)
     v += in[i];
-  if (i + blockDim.x < n)
-    v += in[i + blockDim.x];
-  sdata[tid] = v;
+
+  __shared__ float warp_sums[32];
+  int lane = threadIdx.x & 31;
+  int wid = threadIdx.x >> 5;
+  v = warp_reduce_sum(v);
+  if (lane == 0)
+    warp_sums[wid] = v;
   __syncthreads();
 
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if ((int)tid < s)
-      sdata[tid] += sdata[tid + s];
-    __syncthreads();
+  int n_warps = (blockDim.x + 31) >> 5;
+  if (wid == 0) {
+    v = lane < n_warps ? warp_sums[lane] : 0.0f;
+    v = warp_reduce_sum(v);
+    if (lane == 0)
+      out[blockIdx.x] = v;
   }
-
-  if (tid == 0)
-    partials[blockIdx.x] = sdata[0];
 }
 
 // conv2d
@@ -610,32 +693,32 @@ void device_synchronize() {
 // element-wise operations
 
 void add(const float *a, const float *b, float *out, size_t n) {
-  add_k<<<grid_size(n, THREADS), THREADS>>>(a, b, out, n);
+  launch_binary(a, b, out, n, AddOp{});
   cuda_check(cudaGetLastError(), "add");
 }
 
 void sub(const float *a, const float *b, float *out, size_t n) {
-  sub_k<<<grid_size(n, THREADS), THREADS>>>(a, b, out, n);
+  launch_binary(a, b, out, n, SubOp{});
   cuda_check(cudaGetLastError(), "sub");
 }
 
 void mul(const float *a, const float *b, float *out, size_t n) {
-  mul_k<<<grid_size(n, THREADS), THREADS>>>(a, b, out, n);
+  launch_binary(a, b, out, n, MulOp{});
   cuda_check(cudaGetLastError(), "mul");
 }
 
 void div(const float *a, const float *b, float *out, size_t n) {
-  div_k<<<grid_size(n, THREADS), THREADS>>>(a, b, out, n);
+  launch_binary(a, b, out, n, DivOp{});
   cuda_check(cudaGetLastError(), "div");
 }
 
 void add_scalar(const float *a, float s, float *out, size_t n) {
-  add_scalar_k<<<grid_size(n, THREADS), THREADS>>>(a, s, out, n);
+  launch_unary(a, out, n, AddScalarOp{s});
   cuda_check(cudaGetLastError(), "add_scalar");
 }
 
 void mul_scalar(const float *a, float s, float *out, size_t n) {
-  mul_scalar_k<<<grid_size(n, THREADS), THREADS>>>(a, s, out, n);
+  launch_unary(a, out, n, MulScalarOp{s});
   cuda_check(cudaGetLastError(), "mul_scalar");
 }
 
@@ -649,33 +732,33 @@ void broadcast_binop(const float *a, const float *b, float *out, size_t n,
 // activations
 
 void relu(const float *a, float *out, size_t n) {
-  relu_k<<<grid_size(n, THREADS), THREADS>>>(a, out, n);
+  launch_unary(a, out, n, ReluOp{});
   cuda_check(cudaGetLastError(), "relu");
 }
 
 void relu_backward(const float *grad, const float *input, float *out,
                    size_t n) {
-  relu_backward_k<<<grid_size(n, THREADS), THREADS>>>(grad, input, out, n);
+  launch_binary(grad, input, out, n, ReluBackOp{});
   cuda_check(cudaGetLastError(), "relu_backward");
 }
 
 void sigmoid(const float *a, float *out, size_t n) {
-  sigmoid_k<<<grid_size(n, THREADS), THREADS>>>(a, out, n);
+  launch_unary(a, out, n, SigmoidOp{});
   cuda_check(cudaGetLastError(), "sigmoid");
 }
 
 void tanh_act(const float *a, float *out, size_t n) {
-  tanh_k<<<grid_size(n, THREADS), THREADS>>>(a, out, n);
+  launch_unary(a, out, n, TanhOp{});
   cuda_check(cudaGetLastError(), "tanh");
 }
 
 void exp_act(const float *a, float *out, size_t n) {
-  exp_k<<<grid_size(n, THREADS), THREADS>>>(a, out, n);
+  launch_unary(a, out, n, ExpOp{});
   cuda_check(cudaGetLastError(), "exp");
 }
 
 void log_act(const float *a, float *out, size_t n) {
-  log_k<<<grid_size(n, THREADS), THREADS>>>(a, out, n);
+  launch_unary(a, out, n, LogOp{});
   cuda_check(cudaGetLastError(), "log");
 }
 
@@ -705,25 +788,26 @@ void transpose2d(const float *a, float *out, size_t rows, size_t cols) {
 float sum(const float *a, size_t n) {
   if (n == 0)
     return 0.0f;
-  int threads = THREADS;
-  int blocks =
-      static_cast<int>((n + (size_t)threads * 2 - 1) / ((size_t)threads * 2));
+  int blocks = capped_blocks(n);
 
-  float *partials = nullptr;
-  cuda_check(cudaMalloc(&partials, blocks * sizeof(float)), "sum.alloc");
-  sum_partial_k<<<blocks, threads, threads * sizeof(float)>>>(a, partials, n);
-  cuda_check(cudaGetLastError(), "sum.partial");
+  // one scratch buffer holds the per-block partials in [0, blocks) and the
+  // final scalar at [blocks]; the second pass reduces the partials in place on
+  // the GPU so exactly one float crosses the bus
+  float *scratch = nullptr;
+  cuda_check(cudaMalloc(&scratch, ((size_t)blocks + 1) * sizeof(float)),
+             "sum.alloc");
 
-  std::vector<float> host(blocks);
-  cuda_check(cudaMemcpy(host.data(), partials, blocks * sizeof(float),
+  reduce_sum_k<<<blocks, THREADS>>>(a, scratch, n);
+  cuda_check(cudaGetLastError(), "sum.pass1");
+  reduce_sum_k<<<1, THREADS>>>(scratch, scratch + blocks, (size_t)blocks);
+  cuda_check(cudaGetLastError(), "sum.pass2");
+
+  float result = 0.0f;
+  cuda_check(cudaMemcpy(&result, scratch + blocks, sizeof(float),
                         cudaMemcpyDeviceToHost),
              "sum.d2h");
-  cudaFree(partials);
-
-  double total = 0.0;
-  for (float v : host)
-    total += v;
-  return static_cast<float>(total);
+  cudaFree(scratch);
+  return result;
 }
 
 // conv / pool
